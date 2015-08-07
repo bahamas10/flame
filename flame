@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# Generate a flamegraph the easy way with DTrace and stackvis
+#
+# Author: Dave Eddy <dave@daveeddy.com>
+# Date: July 30, 2015
+# License: MIT
+
+fatal() {
+	echo "flame: $*" >&2
+	exit 1
+}
+
+usage() {
+	local prog=${0##*/}
+	cat <<-EOF
+	Usage: $prog [-o] [-p pid] [-s stack] [-t secs] prog args
+
+	Generate a flamegraph easily using DTrace and optionally stackvis.
+	A program can be specified as the operands to be executed, or an
+	already running program can be given by pid with -p.
+
+	Examples
+
+	  Generate a flamegraph for zoneadm list and write the HTML to file
+	    # flame zoneadm list -cv > graph.html
+
+	  Generate a flamegraph and share it to Manta for rsyslog for 20 seconds
+	    # flame -p "\$(pgrep rsyslogd)" -t 20 | stackvis share
+
+	  Dump unmodified DTrace output to stdout for a node program (raw mode)
+	    # flame -r node foo.js
+
+	Options
+
+	  -h           print this message and exit
+	  -p <pid>     trace the pid given
+	  -r           raw mode, don't run stackvis just print what dtrace outputs
+	  -s <stack>   stack function to use, defaults to stack() or jstack() depend on execname
+	  -t <secs>    seconds to trace when run with "-p <pid>", defaults to $seconds
+	EOF
+}
+
+# process arguments
+pid=
+seconds=30
+stack=
+raw=false
+while getopts 'hp:rs:t:' option; do
+	case "$option" in
+		h) usage; exit 0;;
+		p) pid=$OPTARG;;
+		r) raw=true;;
+		s) stack=$OPTARG;;
+		t) seconds=$OPTARG;;
+		*) usage >&2; exit 1;;
+	esac
+done
+shift $((OPTIND - 1))
+
+# figure out executable name
+if [[ -n $pid ]]; then
+	name=$(pargs "$pid" | awk '/^argv\[0\]/ { print $2 }' | xargs basename)
+else
+	name=${1##*/}
+fi
+
+[[ -n $name ]] || fatal 'executable name could not be determined'
+
+# determine what stack function to use based on program name (kinda lame)
+# if the user didn't specify one with `-s <stack>`
+if [[ -z $stack ]]; then
+	case "$name" in
+		node) stack='jstack';;
+		*) stack='ustack';;
+	esac
+fi
+echo "> program is '$name' - using $stack stack function" >&2
+
+# dtrace output, program to call, and arguments
+cleanup() {
+	echo '> cleaning temporary files' >&2
+	rm -f "$dtraceout" "$dtraceprog" "$dtraceprogargs"
+}
+dtraceout=$(mktemp /tmp/flame-dtrace-out.$$.XXXXXXX.txt)
+dtraceprog=$(mktemp /tmp/flame-dtrace-prog.$$.XXXXXXX)
+dtraceprogargs=$(mktemp /tmp/flame-dtrace-prog-args.$$.XXXXXXX)
+trap cleanup EXIT
+
+# construct DTrace command line
+script="profile-97 /pid == \$target/ { @[$stack(80, 8192)] = count(); }"
+[[ -n $pid ]] && script+=" tick-${seconds}s { exit(0); }"
+dtraceopts=(
+	'-n'
+	"$script"
+	'-o'
+	"$dtraceout"
+)
+if [[ -n $pid ]]; then
+	dtraceopts+=(-p "$pid")
+else
+	# The user specified the program to execute as the operands to this
+	# program.  We create a temporary bash script to execute that:
+	# 1: redirects stdout and stderr to /dev/null to silence all output
+	# 2: exec's the program the user wants passed as arguments in afile
+	#    seperatated by nul characters
+	# We do this because DTrace's `-c` option doesn't invoke any shell
+	# logic, which prevents us from silencing stdout and stderr, as well
+	# as properly passing in arguments.
+	#
+	# We create a file called $dtraceprogargs that contains the arguments
+	# of the program to call separated safely by nul characters.
+	# Then, we create the calling program which will read the arguments
+	# in the file to call it predictably.
+	printf '%s\0' "$@" > "$dtraceprogargs"
+	cat > "$dtraceprog" <<-'EOF'
+	#!/usr/bin/env bash
+	file=$1
+	exec 1>/dev/null
+	exec 2>/dev/null
+	args=()
+	while IFS= read -r -d '' arg; do args+=("$arg"); done < "$file"
+	exec "${args[@]}"
+	EOF
+	chmod +x "$dtraceprog"
+	dtraceopts+=(-c "$dtraceprog $dtraceprogargs")
+fi
+
+echo -n '> calling dtrace:' >&2
+printf ' "%s"' "${dtraceopts[@]}" >&2
+echo >&2
+dtrace "${dtraceopts[@]}" || fatal 'failed to call DTrace'
+if $raw; then
+	cat "$dtraceout"
+else
+	stackvis < "$dtraceout"
+fi
